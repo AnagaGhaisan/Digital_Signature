@@ -1,4 +1,7 @@
 const SHEET_NAME = "Signups";
+const TEMPLATE_ID = "12hjfxHro23H38bS1gs0OuB-UEHmq8_6JflMCY8-h9Rw"; // ganti ID Google Docs Template kamu
+// const FOLDER_ID = "";  // opsional, biar semua hasil disimpan di folder tertentu
+
 
 // === SAVE + QR + EMAIL ===
 function saveSignupWithQR(payload) {
@@ -6,7 +9,6 @@ function saveSignupWithQR(payload) {
     throw new Error("Field mandatory not completed.");
   }
 
-  // Ambil email akun Google yg login
   const userEmail = Session.getActiveUser().getEmail();
   if (!userEmail) {
     throw new Error("Tidak bisa ambil email Google, cek setting Web App deployment.");
@@ -16,10 +18,9 @@ function saveSignupWithQR(payload) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(SHEET_NAME);
 
-  // Buat UUID unik untuk record
   const recordId = Utilities.getUuid();
 
-  // Simpan row ke sheet
+  // simpan row dasar
   sh.appendRow([
     recordId,
     timestamp,
@@ -30,19 +31,34 @@ function saveSignupWithQR(payload) {
     payload.docName,
     payload.ip || '',
     payload.ua || '',
-    payload.ccEmail || ''
+    payload.ccEmail || '',
+    '' // kolom link dokumen, nanti diisi
   ]);
 
-  // URL detail WebApp
   const webAppUrl = ScriptApp.getService().getUrl();
   const detailUrl = `${webAppUrl}?id=${recordId}`;
 
-  // Buat QR Code (isi link detail)
   const qrUrl = "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" 
                + encodeURIComponent(detailUrl);
   const qrBlob = UrlFetchApp.fetch(qrUrl).getBlob().setName(`qr_${Date.now()}.png`);
 
-  // Kirim email
+  // === GENERATE DOC FROM TEMPLATE ===
+  const docResult = createDocFromTemplate({
+    id: recordId,
+    name: payload.name,
+    email: userEmail,
+    role: payload.role,
+    docId: payload.docId,
+    docName: payload.docName,
+    date: timestamp
+  }, qrBlob);
+
+
+  // update baris terakhir dengan URL dokumen
+  const lastRow = sh.getLastRow();
+  sh.getRange(lastRow, 11).setValue(docResult.docUrl);
+
+  // === EMAIL ===
   const recipients = [userEmail];
   if (payload.ccEmail) recipients.push(payload.ccEmail);
 
@@ -63,12 +79,53 @@ function saveSignupWithQR(payload) {
       <p><b>Digital Signature (click or scan):</b><br>
       <a href="${detailUrl}"><img src="cid:qr"></a></p>
       <p>Click the QR image or scan it to view your signature online.</p>
+      <p><b>Generated Document:</b> <a href="${docResult.docUrl}">Open Document</a></p>
     `,
     inlineImages: { qr: qrBlob }
   });
 
-  return { ok: true, id: recordId, qrUrl, detailUrl };
+  return { ok: true, id: recordId, qrUrl, detailUrl, docUrl: docResult.docUrl };
 }
+
+// === GENERATE DOC FROM TEMPLATE ===
+function createDocFromTemplate(data, qrBlob) {
+  const template = DriveApp.getFileById(TEMPLATE_ID);
+  const folder = FOLDER_ID ? DriveApp.getFolderById(FOLDER_ID) : DriveApp.getRootFolder();
+
+  const copy = template.makeCopy(`Signature_${data.name}_${Date.now()}`, folder);
+  const doc = DocumentApp.openById(copy.getId());
+  const body = doc.getBody();
+
+  // Replace text placeholders
+  body.replaceText("{{ID}}", data.id);
+  body.replaceText("{{Name}}", data.name);
+  body.replaceText("{{Email}}", data.email);
+  body.replaceText("{{Role}}", data.role);
+  body.replaceText("{{DocId}}", data.docId);
+  body.replaceText("{{DocName}}", data.docName);
+  body.replaceText("{{Date}}", new Date(data.date).toLocaleString());
+
+  // Sisipkan QR di bagian akhir dokumen (atau bisa ganti {{QR}} placeholder)
+  if (body.findText("{{QR}}")) {
+  const el = body.findText("{{QR}}").getElement();
+  el.asText().setText(""); // hapus placeholder
+  // Sisipkan QR dan atur ukurannya
+  const qrImage = el.getParent().insertInlineImage(0, qrBlob);
+  qrImage.setWidth(96).setHeight(96); 
+} else {
+  body.appendParagraph("Digital Signature QR:");
+  const qrImage = body.appendImage(qrBlob);
+  qrImage.setWidth(96).setHeight(96); 
+}
+
+  doc.saveAndClose();
+
+  return {
+    docId: doc.getId(),
+    docUrl: doc.getUrl()
+  };
+}
+
 
 // === API POST ===
 function doPost(e) {
@@ -135,4 +192,43 @@ function doGet(e) {
       .addMetaTag("viewport", "width=device-width, initial-scale=1.0, maximum-scale=1.2")
       .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
   }
+}
+
+// === DOWNLOAD QR ===
+function doGetDownload(e) {
+  const id = e.parameter.id;
+  if (!id) {
+    return ContentService.createTextOutput("Missing ID");
+  }
+
+  // Cari record di sheet
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(SHEET_NAME);
+  const data = sh.getDataRange().getValues();
+  const rows = data.slice(1);
+  const record = rows.find(r => r[0] === id);
+
+  if (!record) {
+    return ContentService.createTextOutput("Record not found");
+  }
+
+  // Buat ulang QR Blob berdasarkan detail URL
+  const webAppUrl = ScriptApp.getService().getUrl();
+  const detailUrl = `${webAppUrl}?id=${record[0]}`;
+  const qrUrl = "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data="
+               + encodeURIComponent(detailUrl);
+
+  const qrBlob = UrlFetchApp.fetch(qrUrl).getBlob()
+                 .setName(`qr_${record[0]}.png`);
+
+  // Kembalikan blob sebagai download
+  return HtmlService.createHtmlOutput(
+    `<script>
+       const link = document.createElement("a");
+       link.href = "data:image/png;base64,${Utilities.base64Encode(qrBlob.getBytes())}";
+       link.download = "qr_${record[0]}.png";
+       link.click();
+       window.close();
+     </script>`
+  );
 }
